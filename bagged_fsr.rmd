@@ -1,0 +1,124 @@
+---
+title: "Comparing Bagged Forward Stepwise Regression (FSR) and LASSO"
+author: "Gaurav"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(MASS)    # For correlated data generation
+library(caret)   # For train-test splitting
+library(glmnet)  # For LASSO
+library(ggplot2) # For visualization
+library(leaps)   # For Forward Stepwise Regression
+library(dplyr)   # For data manipulation
+```
+
+### Data Simulation 
+
+```{r data_sim, include = FALSE}
+set.seed(42)
+
+n <- 300    # Number of observations
+p <- 20     # Number of predictors
+
+# Define correlation structure: X1-X5 are correlated (~0.6 correlation), others independent
+mu <- rep(0, p)
+Sigma <- diag(p)
+Sigma[1:5, 1:5] <- 0.6
+diag(Sigma) <- 1
+
+# Generate multivariate normal data
+X <- mvrnorm(n, mu = mu, Sigma = Sigma)
+colnames(X) <- paste0("X", 1:p)
+
+# True coefficients (only a subset of predictors are important)
+true_coefs <- rep(0, p)
+true_coefs[c(1, 3, 5, 10)] <- c(3, -2, 5, 4) 
+
+# Generate response variable Y
+Y <- X %*% true_coefs + rnorm(n, sd = 2)
+data <- data.frame(X, Y = Y)
+```
+
+### Train Test Split
+
+```{r train_test}
+set.seed(42)
+train_index <- createDataPartition(data$Y, p = 0.8, list = FALSE)
+train_data <- data[train_index, ]
+test_data  <- data[-train_index, ]
+```
+
+### FSR
+
+```{r fsr}
+# Fit Forward Stepwise Regression on training data
+null_model <- lm(Y ~ 1, data = train_data)
+full_model <- lm(Y ~ ., data = train_data)
+
+fsr_model <- step(null_model, scope = list(lower = ~1, upper = formula(full_model)),
+                  direction = "forward", trace = FALSE)
+
+fsr_selected_vars <- names(coef(fsr_model))[-1]
+fsr_selected_vars
+```
+
+
+### Bagged FSR
+
+```{r bagged_fsr}
+
+set.seed(42)
+B <- 100  # Number of bootstrap models
+n_train <- nrow(train_data)
+pred_matrix <- matrix(0, nrow = nrow(test_data), ncol = B)
+var_selected_list <- vector("list", B)
+
+for (b in 1:B) {
+  boot_idx <- sample(seq_len(n_train), size = n_train, replace = TRUE)
+  boot_train <- train_data[boot_idx, ]
+
+  boot_null <- lm(Y ~ 1, data = boot_train)
+  boot_full <- lm(Y ~ ., data = boot_train)
+  boot_model <- step(boot_null, scope = list(lower = ~1, upper = formula(boot_full)),
+                     direction = "forward", trace = FALSE)
+
+  pred_matrix[, b] <- predict(boot_model, newdata = test_data)
+  var_selected_list[[b]] <- names(coef(boot_model))[-1]
+}
+
+bagged_preds <- rowMeans(pred_matrix)
+bagged_rmse <- sqrt(mean((test_data$Y - bagged_preds)^2))
+bagged_rmse
+```
+
+### LASSO
+
+```{r lasso}
+
+x_train <- model.matrix(Y ~ . - 1, data = train_data)
+y_train <- train_data$Y
+x_test  <- model.matrix(Y ~ . - 1, data = test_data)
+y_test  <- test_data$Y
+
+cv_lasso <- cv.glmnet(x_train, y_train, alpha = 1, nfolds = 10)
+best_lambda <- cv_lasso$lambda.min
+
+lasso_model <- glmnet(x_train, y_train, alpha = 1, lambda = best_lambda)
+lasso_preds <- predict(lasso_model, newx = x_test)
+lasso_rmse <- sqrt(mean((y_test - as.vector(lasso_preds))^2))
+lasso_rmse
+
+```
+
+### OOS comparison
+
+```{r oos}
+cat("Test RMSE:\n",
+    "FSR (single model):       ", round(sqrt(mean((test_data$Y - predict(fsr_model, newdata = test_data))^2)), 3), "\n",
+    "Bagged FSR (ensemble):   ", round(bagged_rmse, 3), "\n",
+    "LASSO (with CV lambda):  ", round(lasso_rmse, 3), "\n")
+```
+
